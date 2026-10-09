@@ -2,6 +2,7 @@ const ApprovalRequest = require('../../models/ApprovalRequest');
 const User = require('../../models/User');
 const Company = require('../../models/Company');
 const Installer = require('../../models/Installer');
+const Variant = require('../../models/Variant');
 const AuditLog = require('../../models/AuditLog');
 const { createError } = require('../../middlewares/errorHandler');
 const { getQueue } = require('../../queues');
@@ -185,19 +186,28 @@ const assign = async (req, res, next) => {
       return next(createError(400, 'Target user must be a staff member.'));
     }
 
-    const request = await ApprovalRequest.findByIdAndUpdate(
-      req.params.id,
-      {
-        $set: {
-          assignedTo: staffId,
-          assignedAt: new Date(),
-          status: 'in_review',
-        },
-      },
-      { new: true }
-    ).populate('applicant', 'firstName lastName email');
-
+    const request = await ApprovalRequest.findById(req.params.id);
     if (!request) return next(createError(404, 'Application not found.'));
+    request.assignmentHistory.push({
+      assignedTo: staffId,
+      assignedBy: req.user._id,
+      assignedAt: new Date(),
+    });
+    request.assignedTo = staffId;
+    request.assignedAt = new Date();
+    request.status = 'in_review';
+    await request.save();
+    await request.populate('applicant', 'firstName lastName email');
+
+    await AuditLog.record({
+      event: 'approval_assigned',
+      actor: req.user._id,
+      actorEmail: req.user.email,
+      subject: request.applicant?._id,
+      subjectEmail: request.applicant?.email || '',
+      meta: { requestId: String(request._id), staffId: String(staffId) },
+      ip: req.ip,
+    });
 
     res.json({ success: true, data: request });
   } catch (err) {
@@ -215,8 +225,8 @@ const approve = async (req, res, next) => {
 
     if (!request) {return next(createError(404, 'Application not found.'));}
     if (!request.applicant) {return next(createError(404, 'The applicant account no longer exists.'));}
-    if (request.status === 'approved') {
-      return next(createError(409, 'Application is already approved.'));
+    if (!['pending', 'in_review'].includes(request.status)) {
+      return next(createError(409, `Application cannot be approved from status "${request.status}".`));
     }
     const installerData = request.type === 'installer_application' ? request.data || {} : null;
     if (installerData) {
@@ -236,10 +246,38 @@ const approve = async (req, res, next) => {
       }
     }
 
+    const companyApplication = ['dealer_application', 'specifier_application'].includes(request.type);
+    const company = companyApplication && request.company ? await Company.findById(request.company) : null;
+    if (companyApplication && request.company && !company) {
+      return next(createError(409, 'The company associated with this application no longer exists.'));
+    }
+    let approvedRole = '';
+    if (request.type === 'dealer_application' || request.type === 'specifier_application') {
+      approvedRole = request.type === 'dealer_application' ? 'dealer' : 'specifier';
+      if (!company || company.type !== approvedRole) {
+        return next(createError(409, 'The company type does not match the application.'));
+      }
+      if (roleGranted !== undefined && roleGranted !== approvedRole) {
+        return next(createError(400, `This application can only grant the ${approvedRole} role.`));
+      }
+      if (approvedRole === 'dealer') {
+        if (typeof pricingGroupGranted !== 'string' || !pricingGroupGranted.trim()) {
+          return next(createError(400, 'A pricing group must be assigned when approving a dealer.'));
+        }
+        const availableGroups = await Variant.distinct('priceTiers.tierKey');
+        if (!availableGroups.includes(pricingGroupGranted)) {
+          return next(createError(400, 'The selected pricing group is not present in the catalog.'));
+        }
+      }
+    } else if (roleGranted && !['installer', 'customer'].includes(roleGranted)) {
+      return next(createError(400, 'This approval cannot grant a privileged role.'));
+    }
+
     // Apply role and/or pricing group changes to the user
     const userUpdates = {};
-    const grantedRole = roleGranted || (request.type === 'installer_application' ? 'installer' : '');
+    const grantedRole = approvedRole || roleGranted || (request.type === 'installer_application' ? 'installer' : '');
     if (grantedRole)         userUpdates.role = grantedRole;
+    if (grantedRole) userUpdates.tokenVersion = request.applicant.tokenVersion + 1;
     if (pricingGroupGranted) userUpdates.pricingGroup = pricingGroupGranted;
 
     // Pricing group ONLY via staff approval — enforced here
@@ -289,10 +327,13 @@ const approve = async (req, res, next) => {
     }
 
     // If company-level approval, update company too
-    if (request.company && pricingGroupGranted) {
-      await Company.findByIdAndUpdate(request.company, {
-        $set: { pricingGroup: pricingGroupGranted, isApproved: true, approvedAt: new Date(), approvedBy: req.user._id },
-      });
+    if (company) {
+      company.isApproved = true;
+      company.isActive = true;
+      company.approvedAt = new Date();
+      company.approvedBy = req.user._id;
+      if (pricingGroupGranted) company.pricingGroup = pricingGroupGranted;
+      await company.save();
     }
 
     // Update the request itself
@@ -359,6 +400,13 @@ const reject = async (req, res, next) => {
     request.resolvedAt = new Date();
     request.resolution = resolution || '';
     await request.save();
+    if (request.company) {
+      await Company.updateOne({ _id: request.company, isApproved: false }, { $set: { isActive: false } });
+      await User.updateOne(
+        { _id: request.applicant._id, company: request.company },
+        { $set: { company: null, isCompanyAdmin: false }, $inc: { tokenVersion: 1 } },
+      );
+    }
 
     await AuditLog.record({
       event: 'approval_resolved',

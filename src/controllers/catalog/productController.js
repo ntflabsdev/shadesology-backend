@@ -9,6 +9,7 @@ const { createError }= require('../../middlewares/errorHandler');
 const { buildModuleVisibility } = require('../../utils/moduleRules');
 const { buildProductJsonLd, buildBreadcrumbJsonLd } = require('../../utils/jsonLd');
 const pricing = require('@shadesology/pricing');
+const { resolvePricingUser } = require('../../services/commercialPricing');
 const {
   isPayloadEditorialSource,
   publishedReadFilter,
@@ -35,19 +36,20 @@ const productMatchesPayloadFilters = (product, filters) => {
   return true;
 };
 
-const addPayloadPrices = async (products, variants = null) => {
+const addPayloadPrices = async (products, variants = null, user = null) => {
   const cmsVariants = variants || await payloadCatalog.getVariantsForProducts(products.map((product) => toId(product.id || product._id)));
   const skus = [...new Set(cmsVariants.map((variant) => variant.sku).filter(Boolean))];
   const commerceVariants = skus.length
     ? await Variant.find(publishedReadFilter({ sku: { $in: skus }, isActive: true }))
-      .select('sku basePrice availability')
+      .select('sku basePrice priceTiers availability')
       .lean()
     : [];
   const priceBySku = new Map();
   for (const variant of commerceVariants) {
     const current = priceBySku.get(variant.sku);
-    if (variant.availability !== 'discontinued' && (!current || variant.basePrice < current)) {
-      priceBySku.set(variant.sku, variant.basePrice);
+    const { displayPrice } = pricing.resolvePriceForUser(variant.basePrice, variant.priceTiers || [], user);
+    if (variant.availability !== 'discontinued' && (current === undefined || displayPrice < current)) {
+      priceBySku.set(variant.sku, displayPrice);
     }
   }
   const variantsByProduct = new Map();
@@ -211,7 +213,7 @@ const sanitiseVariant = (variant, showPrice, user) => {
 const getProduct = async (req, res, next) => {
   try {
     const { slug } = req.params;
-    const user     = req.user || null; // set by optionalAuthenticate
+    const user     = await resolvePricingUser(req.user || null);
 
     if (isPayloadEditorialSource()) {
       const data = await getPayloadProduct(slug, user);
@@ -379,6 +381,7 @@ const getProduct = async (req, res, next) => {
 // ─── Public: list products (with optional category/type filter) ───────────────
 const listProducts = async (req, res, next) => {
   try {
+    const user = await resolvePricingUser(req.user || null);
     const {
       category,
       productType,
@@ -395,7 +398,7 @@ const listProducts = async (req, res, next) => {
         .filter((product) => product.isActive !== false)
         .filter((product) => productMatchesPayloadFilters(product, { category, productType, featured: Boolean(featured) }));
       const cmsVariants = await payloadCatalog.getVariantsForProducts(allProducts.map((product) => toId(product.id || product._id)));
-      const cards = await addPayloadPrices(allProducts, cmsVariants);
+      const cards = await addPayloadPrices(allProducts, cmsVariants, user);
       const priceById = new Map(cards.map((card) => [card._id, card.priceFrom]));
       let sorted = [...allProducts];
       if (sort === 'price_asc' || sort === 'price_desc') {
@@ -446,21 +449,22 @@ const listProducts = async (req, res, next) => {
       Product.countDocuments(publishedReadFilter(filter)),
     ]);
 
-    // Attach min retail price
+    // Attach the minimum price visible to this user without exposing tier data.
     const ids      = products.map((p) => p._id);
     const variants = await Variant.find(publishedReadFilter({ product: { $in: ids }, isActive: true }))
-      .select('product basePrice availability')
+      .select('product basePrice priceTiers availability')
       .lean();
 
     const priceMap = {};
     for (const v of variants) {
       const pid = v.product.toString();
-      if (!priceMap[pid] || v.basePrice < priceMap[pid]) {priceMap[pid] = v.basePrice;}
+      const displayPrice = pricing.resolvePriceForUser(v.basePrice, v.priceTiers || [], user).displayPrice;
+      if (priceMap[pid] === undefined || displayPrice < priceMap[pid]) {priceMap[pid] = displayPrice;}
     }
 
     const result = products.map((p) => ({
       ...p,
-      priceFrom: p.showPrice ? (priceMap[p._id.toString()] || null) : null,
+      priceFrom: p.showPrice ? (priceMap[p._id.toString()] ?? null) : null,
     }));
 
     res.json({

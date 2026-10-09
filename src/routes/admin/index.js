@@ -49,6 +49,7 @@ router.use(payloadManagedCollections, (req, res, next) => {
 
 // ─── Resource routes ──────────────────────────────────────────────────────────
 router.use('/users',                 require('./users'));
+router.use('/portals',               require('./portals'));
 router.use('/approvals',             require('./approvals'));
 router.use('/homepage',              require('./homepage'));
 router.use('/segment-pages',         require('./segmentPages'));

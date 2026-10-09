@@ -61,6 +61,17 @@ Never mix these — sending marketing through SES pollutes your sender reputatio
 - Technical document access checks the installer's product certifications both in the portal and on the shared document-download endpoint. Staff manage certification product types and ranking on `/admin/installers`; lead-flow totals and response rates are available from `/admin/installers/lead-flow`.
 - Third-party referral handoff is configured per region with `GET/PUT /admin/installers/referrals`. Turning a region off is an admin action: set `enabled` to `false`; no code or deployment change is needed. Public referral clicks are counted by `POST /api/installers/referrals/:region/click`. Queue delayed onboarding emails in production with Redis/BullMQ enabled.
 
+## Specifier and dealer portals
+
+- Applications use the verified-account endpoints under `/api/portals/applications`; verification attachments are uploaded to private S3 and attached to the shared staff approval queue. Approval binds the matching company role, activates the company, and assigns dealer pricing tiers through the staff approval flow.
+- Company admins invite verified members at `/api/portals/company/invitations`, transfer company-admin delegation, and review their company membership. Invitation tokens are hashed at rest, expire after seven days, and are atomically claimed when accepted.
+- Specifier and dealer APIs are isolated under `/api/portals/specifier` and `/api/portals/dealer`. The shared `/api/downloads/:id` endpoint and public resource libraries also reject professional-audience documents; only verified members of an active, approved matching company can download those assets.
+- Professional documents are managed through `/admin/documents` (or Payload Admin when editorial content is Payload-backed). Tag each private document for `specifier` or `dealer`, set effective/expiry dates, and keep the source file in private S3. Portal download routes issue five-minute signed URLs and persist per-user/company access records.
+- Dealer tier prices are resolved server-side from the approved dealer company and user pricing group across product detail, product listing, category listing, cart, and checkout responses. Raw price-tier arrays are not returned to retail users. Purchase-order checkout requires an approved dealer with net terms, a PO reference, and available credit; the credit limit is reserved atomically and released when a PO order is cancelled.
+- Dealers can save company-scoped resale quote drafts from `/api/portals/dealer/quotes`. The server resolves each dealer cost from the approved catalog tier and computes resale prices using the requested markup percentage; client-supplied prices are ignored.
+- Dealer training completion and warranty claims are scoped to the member's company. Claim photos are private S3 objects, and staff receive short-lived links from `/admin/portals/claims/:id/photos/:photoIndex/url`. Company and claim operations, pricing views, document downloads, role updates, and staff lifecycle changes are available in the staff audit stream at `/admin/portals/audit`.
+- Configure company payment terms and credit limits through `/admin/portals/companies`; staff must use `/admin/orders` to record PO payments. Transactional application and order notifications are queued through SES/BullMQ and require the normal email/Redis configuration.
+
 ## S3 bucket rules
 
 - **Public bucket** (`S3_BUCKET_PUBLIC`): CMS media, product images. Files served directly via `S3_PUBLIC_BASE_URL`. Block Public Access should be **OFF**.

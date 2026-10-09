@@ -30,6 +30,7 @@ const financingRouter = require('./routes/financing');
 const privacyRouter = require('./routes/privacy');
 const payloadContentRouter = require('./routes/payloadContent');
 const phase3ContentRouter = require('./routes/phase3Content');
+const portalsRouter = require('./routes/portals');
 
 const app = express();
 
@@ -109,6 +110,7 @@ app.use('/api/shipping',   shippingRouter);
 app.use('/api/payments',   paymentsRouter);
 app.use('/api/financing',  financingRouter);
 app.use('/api/privacy',   privacyRouter);
+app.use('/api/portals',   portalsRouter);
 app.use('/api/cms',       payloadContentRouter);
 app.use('/api',           phase3ContentRouter);
 app.use('/admin',         adminRouter);

@@ -10,12 +10,28 @@
 
 const express = require('express');
 const Order   = require('../../models/Order');
+const Company = require('../../models/Company');
 const stripe  = require('../../services/payments/stripe');
 const { enqueueOrderEmail } = require('../../services/orderNotifications');
 const { normalizeOrderForResponse } = require('../../services/orderFormatting');
 const { createError } = require('../../middlewares/errorHandler');
 
 const router = express.Router();
+
+async function releasePurchaseOrderCredit(order, amount) {
+  if (order.paymentMethod !== 'purchase_order' || !order.company || amount <= 0) {return;}
+  const result = await Company.updateOne(
+    { _id: order.company },
+    [{
+      $set: {
+        pendingBalance: {
+          $max: [0, { $subtract: [{ $ifNull: ['$pendingBalance', 0] }, amount] }],
+        },
+      },
+    }],
+  );
+  if (!result.matchedCount) {throw createError(409, 'The dealer company linked to this order no longer exists.');}
+}
 
 router.post('/:id/balance-payment', async (req, res, next) => {
   try {
@@ -134,6 +150,35 @@ router.post('/:id/record-transfer', async (req, res, next) => {
       await enqueueOrderEmail(order, 'balance_paid', { note: 'Your remaining bank transfer balance has been recorded as paid.' });
     }
     res.json({ success: true, data: order });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/:id/record-purchase-order-payment', async (req, res, next) => {
+  try {
+    const { amount } = req.body;
+    if (!Number.isFinite(amount) || amount <= 0 || Math.round(amount * 100) !== amount * 100) {
+      return next(createError(400, 'Payment amount must be a positive USD amount with no more than two decimal places.'));
+    }
+    const order = await Order.findById(req.params.id);
+    if (!order) {return next(createError(404, 'Order not found.'));}
+    if (order.paymentMethod !== 'purchase_order' || order.paymentStatus === 'paid' || order.balanceDue <= 0) {
+      return next(createError(409, 'This order does not have an outstanding purchase-order balance.'));
+    }
+    if (amount > order.balanceDue) {
+      return next(createError(422, 'Payment amount exceeds the remaining purchase-order balance.'));
+    }
+    await releasePurchaseOrderCredit(order, amount);
+    order.balancePaid = (order.balancePaid || 0) + amount;
+    order.balanceDue = Math.max(0, order.total - order.balancePaid);
+    order.paymentStatus = order.balanceDue === 0 ? 'paid' : 'deposit_paid';
+    order.paymentTransactions.push({ amount });
+    await order.save();
+    if (order.balanceDue === 0) {
+      await enqueueOrderEmail(order, 'balance_paid', { note: 'Your purchase-order balance has been paid in full.' });
+    }
+    res.json({ success: true, data: normalizeOrderForResponse(order) });
   } catch (err) {
     next(err);
   }
@@ -272,6 +317,10 @@ router.patch('/:id/status', async (req, res, next) => {
       at:        new Date(),
     });
 
+    if (status === 'cancelled') {
+      await releasePurchaseOrderCredit(order, order.balanceDue || order.total);
+      order.balanceDue = 0;
+    }
     await order.save();
     await enqueueOrderEmail(order, status, { note: note || '' });
 
@@ -315,6 +364,8 @@ router.patch('/:id/requests/:requestId', async (req, res, next) => {
         return next(createError(409, 'Cancellation cannot be approved after production or shipment begins.'));
       }
       order.status = 'cancelled';
+      await releasePurchaseOrderCredit(order, order.balanceDue || order.total);
+      order.balanceDue = 0;
       order.cancellationReason = request.reason;
       order.statusHistory.push({
         status: 'cancelled',

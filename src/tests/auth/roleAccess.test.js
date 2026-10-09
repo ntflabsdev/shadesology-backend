@@ -207,6 +207,30 @@ describe('Specifier role — cannot access admin', () => {
     const res = await request('GET', '/admin/products', tokens.specifier);
     assert.equal(res.status, 403, `Expected 403, got ${res.status}`);
   });
+
+  describe('Cross-portal URL escalation', () => {
+    test('unauthenticated users cannot access specifier or dealer portal APIs', async () => {
+      const [specifier, dealer, quote] = await Promise.all([
+        request('GET', '/api/portals/specifier/documents'),
+        request('GET', '/api/portals/dealer/profile'),
+        request('POST', '/api/portals/dealer/quotes', undefined, { markupPercent: 20, items: [] }),
+      ]);
+      assert.equal(specifier.status, 401);
+      assert.equal(dealer.status, 401);
+      assert.equal(quote.status, 401);
+    });
+
+    test('dealer and specifier sessions cannot access the other portal', async () => {
+      const [dealerToSpecifier, specifierToDealer, customerToDealerQuote] = await Promise.all([
+        request('GET', '/api/portals/specifier/documents', tokens.dealer),
+        request('GET', '/api/portals/dealer/profile', tokens.specifier),
+        request('POST', '/api/portals/dealer/quotes', tokens.customer, { markupPercent: 20, items: [] }),
+      ]);
+      assert.equal(dealerToSpecifier.status, 403);
+      assert.equal(specifierToDealer.status, 403);
+      assert.equal(customerToDealerQuote.status, 403);
+    });
+  });
 });
 
 describe('Dealer role — cannot access admin', () => {

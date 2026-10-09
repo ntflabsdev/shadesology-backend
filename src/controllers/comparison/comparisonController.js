@@ -23,6 +23,7 @@ const Variant             = require('../../models/Variant');
 const AttributeDefinition = require('../../models/AttributeDefinition');
 const { createError }     = require('../../middlewares/errorHandler');
 const pricing             = require('@shadesology/pricing');
+const { resolvePricingUser } = require('../../services/commercialPricing');
 
 // ─── GET /api/compare?ids=v1,v2,v3 ──────────────────────────────────────────
 const compare = async (req, res, next) => {
@@ -119,7 +120,7 @@ const compare = async (req, res, next) => {
     const filteredRows = rows.filter((r) => r.values.some((v) => v !== null));
 
     // ── 5. Apply price visibility per user ──────────────────────────────────
-    const user = req.user || null;
+    const user = await resolvePricingUser(req.user || null);
     const items = active.map((v) => {
       const { displayPrice, priceType } = pricing.resolvePriceForUser(
         v.basePrice,

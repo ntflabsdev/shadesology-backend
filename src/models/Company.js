@@ -51,6 +51,7 @@ const companySchema = new mongoose.Schema(
     // Credit terms (for dealer/commercial accounts)
     creditLimit:  { type: Number, default: 0 },
     paymentTerms: { type: String, default: 'prepay' }, // e.g. 'net30', 'net60'
+    pendingBalance: { type: Number, default: 0, min: 0 },
 
     // ─── Type ────────────────────────────────────────────────────────────────
     type: {

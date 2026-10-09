@@ -51,6 +51,27 @@ const attachmentSchema = new mongoose.Schema(
   { _id: true }
 );
 
+const dealerQuoteLineSchema = new mongoose.Schema({
+  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
+  variant: { type: mongoose.Schema.Types.ObjectId, ref: 'Variant', required: true },
+  productName: { type: String, required: true },
+  variantName: { type: String, required: true },
+  sku: { type: String, default: '' },
+  quantity: { type: Number, required: true, min: 1 },
+  unitCost: { type: Number, required: true, min: 0 },
+  resaleUnitPrice: { type: Number, required: true, min: 0 },
+  resaleTotal: { type: Number, required: true, min: 0 },
+});
+
+const dealerQuoteSchema = new mongoose.Schema({
+  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  markupPercent: { type: Number, required: true, min: 0, max: 1000 },
+  items: { type: [dealerQuoteLineSchema], required: true },
+  subtotal: { type: Number, required: true, min: 0 },
+  total: { type: Number, required: true, min: 0 },
+  currency: { type: String, default: 'USD' },
+}, { _id: false });
+
 // ── Main schema ───────────────────────────────────────────────────────────────
 const quoteSchema = new mongoose.Schema(
   {
@@ -65,6 +86,12 @@ const quoteSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       default: null,
+    },
+    company: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Company',
+      default: null,
+      index: true,
     },
     /** Guest contact (used when user is null) */
     guestContact: {
@@ -103,6 +130,7 @@ const quoteSchema = new mongoose.Schema(
     attachments: [attachmentSchema],
 
     // ─── Pricing (populated by staff) ─────────────────────────────────────────
+    dealerQuote: { type: dealerQuoteSchema, default: null },
     subtotal:      { type: Number, default: null },
     tax:           { type: Number, default: null },
     total:         { type: Number, default: null },

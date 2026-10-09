@@ -133,7 +133,8 @@ router.get('/documents', async (req, res, next) => {
     const filter = {
       isActive: true,
       showInResourceLibrary: true,
-      audienceTags: { $nin: ['installer'] },
+      audienceTags: { $nin: ['installer', 'dealer', 'specifier'] },
+      requiredRole: { $nin: ['dealer', 'specifier'] },
       $and: [
         { $or: [{ effectiveDate: null }, { effectiveDate: { $lte: now } }] },
         { $or: [{ expiryDate: null }, { expiryDate: { $gt: now } }] },
@@ -168,7 +169,8 @@ router.get('/documents', async (req, res, next) => {
       }
       const publicDocs = documents
         .filter((doc) => doc.isActive !== false && doc.showInResourceLibrary !== false)
-        .filter((doc) => !(doc.audienceTags || []).includes('installer'))
+        .filter((doc) => !(doc.audienceTags || []).some((tag) => ['installer', 'dealer', 'specifier'].includes(tag)))
+        .filter((doc) => !['dealer', 'specifier'].includes(doc.requiredRole))
         .filter((doc) => !type || doc.type === type)
         .filter((doc) => !requestedProduct || (doc.products || []).some((entry) => toId(entry) === toId(requestedProduct)))
         .filter((doc) => !requestedType || (doc.productTypes || []).some((entry) => toId(entry) === toId(requestedType)))

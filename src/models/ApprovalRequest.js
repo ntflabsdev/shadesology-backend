@@ -79,6 +79,12 @@ const approvalRequestSchema = new mongoose.Schema(
       default: null,
     },
     assignedAt: { type: Date, default: null },
+    assignmentHistory: [{
+      assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+      assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+      assignedAt: { type: Date, default: Date.now },
+      _id: false,
+    }],
 
     // Resolution
     resolvedBy:  { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

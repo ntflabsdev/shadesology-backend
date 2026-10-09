@@ -15,6 +15,9 @@
 
 const Document  = require('../../models/Document');
 const Installer = require('../../models/Installer');
+const Company = require('../../models/Company');
+const DocumentAccess = require('../../models/DocumentAccess');
+const AuditLog = require('../../models/AuditLog');
 const Lead = require('../../models/Lead');
 const hubspot = require('../../services/hubspot');
 
@@ -83,6 +86,22 @@ async function checkInstallerCertification(doc, user) {
   return Boolean(installer);
 }
 
+async function checkProfessionalAudience(doc, user) {
+  const requiredRoles = ['dealer', 'specifier'].filter((role) =>
+    doc.audienceTags?.includes(role) || doc.requiredRole === role);
+  if (!requiredRoles.length) {return true;}
+  if (user?.role === 'staff') {return true;}
+  if (!user?.isEmailVerified || !user.company || !requiredRoles.includes(user.role)) {return false;}
+  if (doc.requiredRole && doc.requiredRole !== user.role) {return false;}
+  const company = await Company.findOne({
+    _id: user.company,
+    type: user.role,
+    isActive: true,
+    isApproved: true,
+  }).select('_id').lean();
+  return Boolean(company);
+}
+
 // ─── GET /api/downloads/:id — serve a document ────────────────────────────────
 const serveDocument = async (req, res, next) => {
   try {
@@ -92,6 +111,9 @@ const serveDocument = async (req, res, next) => {
     // Check expiry
     if (doc.expiryDate && new Date() > new Date(doc.expiryDate)) {
       return next(createError(410, 'This document has expired and is no longer available.'));
+    }
+    if (doc.effectiveDate && new Date(doc.effectiveDate) > new Date()) {
+      return next(createError(404, 'This document is not yet available.'));
     }
 
     const guestEmail = req.body?.email || req.query?.email || null;
@@ -112,6 +134,33 @@ const serveDocument = async (req, res, next) => {
           type: doc.type,
           gating: doc.gating,
         },
+      });
+    }
+
+    if (!await checkProfessionalAudience(doc, req.user || null)) {
+      return next(createError(403, 'An approved professional company account is required to access this document.'));
+    }
+    if (req.user && ['dealer', 'specifier'].some((role) =>
+      doc.audienceTags?.includes(role) || doc.requiredRole === role)) {
+      await DocumentAccess.create({
+        document: doc._id,
+        user: req.user._id,
+        company: req.user.company,
+        ip: req.ip,
+        userAgent: req.get('user-agent') || '',
+      });
+      await AuditLog.record({
+        event: 'document_accessed',
+        actor: req.user._id,
+        actorEmail: req.user.email,
+        meta: {
+          documentId: String(doc._id),
+          documentTitle: doc.title?.en || '',
+          role: req.user.role,
+          companyId: String(req.user.company),
+        },
+        ip: req.ip,
+        userAgent: req.get('user-agent') || '',
       });
     }
 
@@ -260,7 +309,8 @@ const listDocuments = async (req, res, next) => {
       filter.productTypes = { $in: installer?.certifiedProductTypes || [] };
       filter.$and.push({ $or: [{ audienceTags: 'installer' }, { requiredRole: 'installer' }] });
     } else {
-      filter.audienceTags = { $nin: ['installer'] };
+      filter.audienceTags = { $nin: ['installer', 'dealer', 'specifier'] };
+      filter.requiredRole = { $nin: ['dealer', 'specifier'] };
     }
     if (audience && req.user?.role === 'installer' && audience !== 'installer') {
       filter.audienceTags = audience;
@@ -277,4 +327,10 @@ const listDocuments = async (req, res, next) => {
   }
 };
 
-module.exports = { serveDocument, requestDocument, listDocuments, checkInstallerCertification };
+module.exports = {
+  serveDocument,
+  requestDocument,
+  listDocuments,
+  checkInstallerCertification,
+  checkProfessionalAudience,
+};

@@ -163,6 +163,10 @@ const submitQuote = async (req, res, next) => {
       };
     } else {
       quoteData.user = req.user._id;
+      if (req.user.company) {
+        quoteData.company = req.user.company;
+        quoteData.enquiryQueue = 'commercial';
+      }
     }
 
     const quote = await Quote.create(quoteData);

@@ -24,10 +24,12 @@ const {
   richText,
 } = require('../../services/payloadCatalog');
 const { addPayloadPrices } = require('./productController');
+const pricing = require('@shadesology/pricing');
+const { resolvePricingUser } = require('../../services/commercialPricing');
 
 const payloadCatalog = createPayloadCatalog();
 
-const getPayloadCategoryPage = async (slug, query) => {
+const getPayloadCategoryPage = async (slug, query, user) => {
   const sourceCategory = await payloadCatalog.getCategory(slug);
   if (!sourceCategory) {return null;}
   const category = mapPayloadCategory(sourceCategory);
@@ -54,7 +56,7 @@ const getPayloadCategoryPage = async (slug, query) => {
     attrDefs.every((definition) =>
       matchesAttribute(product.attributes?.[definition.key], activeFilters[definition.key], definition)));
   const cmsVariants = await payloadCatalog.getVariantsForProducts(products.map((product) => toId(product.id || product._id)));
-  const productCards = await addPayloadPrices(products, cmsVariants);
+  const productCards = await addPayloadPrices(products, cmsVariants, user);
   const cardById = new Map(productCards.map((card) => [card._id, card]));
   const sortKey = SORT_MAP[sortValue] !== undefined ? sortValue : DEFAULT_SORT;
   let sortedProducts;
@@ -142,8 +144,9 @@ const getCategoryPage = async (req, res, next) => {
       ...queryRest
     } = req.query;
 
+    const user = await resolvePricingUser(req.user || null);
     if (isPayloadEditorialSource()) {
-      const data = await getPayloadCategoryPage(slug, req.query);
+      const data = await getPayloadCategoryPage(slug, req.query, user);
       if (!data) {return next(createError(404, 'Category not found.'));}
       return res.json({ success: true, data });
     }
@@ -205,20 +208,20 @@ const getCategoryPage = async (req, res, next) => {
       .select('product basePrice priceTiers availability')
       .lean();
 
-    // Map productId → min base price (retail — never expose dealer tiers here)
+    // Map productId to the lowest price this user is allowed to see.
     const priceMap = {};
     for (const v of variants) {
       const pid = v.product.toString();
-      if (!priceMap[pid] || v.basePrice < priceMap[pid]) {
-        priceMap[pid] = v.basePrice;
+      const displayPrice = pricing.resolvePriceForUser(v.basePrice, v.priceTiers || [], user).displayPrice;
+      if (priceMap[pid] === undefined || displayPrice < priceMap[pid]) {
+        priceMap[pid] = displayPrice;
       }
     }
 
     // Attach price to product (respects showPrice flag)
     const productsWithPrice = products.map((p) => ({
       ...p,
-      priceFrom: p.showPrice ? (priceMap[p._id.toString()] || null) : null,
-      // NEVER include priceTiers here — retail responses must not contain dealer pricing
+      priceFrom: p.showPrice ? (priceMap[p._id.toString()] ?? null) : null,
     }));
 
     // ── 10. Indexation rules ──────────────────────────────────────────────────

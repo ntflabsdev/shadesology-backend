@@ -11,6 +11,7 @@
 const { createHash, randomUUID } = require('node:crypto');
 const Cart      = require('../../models/Cart');
 const Order     = require('../../models/Order');
+const Company   = require('../../models/Company');
 const CheckoutQuote = require('../../models/CheckoutQuote');
 const Promotion = require('../../models/Promotion');
 const Product   = require('../../models/Product');
@@ -22,6 +23,7 @@ const shippingService = require('../../services/shipping');
 const taxService = require('../../services/tax');
 const stripe = require('../../services/payments/stripe');
 const { enqueueOrderEmail } = require('../../services/orderNotifications');
+const { resolvePricingUser } = require('../../services/commercialPricing');
 
 const CART_COOKIE = 'shades_cart';
 const COOKIE_MAX_AGE = 90 * 24 * 60 * 60 * 1000; // 90 days
@@ -52,6 +54,7 @@ async function resolveCart(req, res) {
 
 // ─── Enrich cart items with live product/variant data + pricing ────────────────
 async function enrichItems(items, user) {
+  const pricingUser = await resolvePricingUser(user);
   return Promise.all(
     items.map(async (item) => {
       const [product, variant] = await Promise.all([
@@ -85,7 +88,7 @@ async function enrichItems(items, user) {
       const breakdown = pricing.calculateLinePrice({
         basePrice:  variant.basePrice,
         priceTiers: variant.priceTiers || [],
-        user,
+        user: pricingUser,
         selectedOptions: optsArray,
         quantity: item.quantity,
       });
@@ -176,10 +179,11 @@ const addItem = async (req, res, next) => {
     }
 
     // Calculate and snapshot the current unit price
+    const pricingUser = await resolvePricingUser(req.user || null);
     const breakdown = pricing.calculateLinePrice({
       basePrice:  variant.basePrice,
       priceTiers: variant.priceTiers || [],
-      user:       req.user || null,
+      user:       pricingUser,
       quantity:   1,
     });
 
@@ -512,6 +516,9 @@ const removeCoupon = async (req, res, next) => {
  *   6. Returns the order number + order id
  */
 const placeOrder = async (req, res, next) => {
+  let reservedCompanyId = null;
+  let reservedCredit = 0;
+  let creditOrderCreated = false;
   try {
     const {
       contact,          // { firstName, lastName, email, phone }
@@ -521,6 +528,7 @@ const placeOrder = async (req, res, next) => {
       checkoutToken,
       paymentMethod = 'card',
       paymentPlan = 'full',
+      purchaseOrderNumber = '',
     } = req.body;
 
     // ── Validate required fields ────────────────────────────────────────────
@@ -530,11 +538,18 @@ const placeOrder = async (req, res, next) => {
     if (!shipping?.line1 || !shipping?.city || !shipping?.state || !shipping?.zip) {
       return next(createError(400, 'Shipping address is incomplete.'));
     }
-    if (!checkoutToken || !['card', 'bank_transfer'].includes(paymentMethod)) {
+    if (!checkoutToken || !['card', 'bank_transfer', 'purchase_order'].includes(paymentMethod)) {
       return next(createError(400, 'A valid checkout quote and payment method are required.'));
     }
     if (!['full', 'deposit'].includes(paymentPlan)) {
       return next(createError(400, 'paymentPlan must be "full" or "deposit".'));
+    }
+    if (paymentMethod === 'purchase_order' && (
+      paymentPlan !== 'full' ||
+      typeof purchaseOrderNumber !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9 _./-]{0,99}$/.test(purchaseOrderNumber.trim())
+    )) {
+      return next(createError(400, 'Purchase order checkout requires a valid PO reference and full payment plan.'));
     }
     const checkoutKey = req.get('Idempotency-Key');
     if (!checkoutKey || !/^[a-zA-Z0-9_-]{16,100}$/.test(checkoutKey)) {
@@ -544,9 +559,11 @@ const placeOrder = async (req, res, next) => {
     const cart = await resolveCart(req, res);
     const existingOrder = await Order.findOne({ checkoutKey }).lean();
     if (existingOrder) {
-      if (existingOrder.paymentMethod === 'bank_transfer') {
+      if (['bank_transfer', 'purchase_order'].includes(existingOrder.paymentMethod)) {
         await enqueueOrderEmail(existingOrder, 'received', {
-          note: 'We received your order and will begin processing after the bank transfer is confirmed.',
+          note: existingOrder.paymentMethod === 'purchase_order'
+            ? 'We received your order against the purchase order reference on your company account.'
+            : 'We received your order and will begin processing after the bank transfer is confirmed.',
         });
       }
       return res.status(200).json({
@@ -554,11 +571,12 @@ const placeOrder = async (req, res, next) => {
         data: {
           orderId: existingOrder._id,
           orderNumber: existingOrder.orderNumber,
+          purchaseOrderNumber: existingOrder.purchaseOrderNumber,
           total: existingOrder.total,
           checkoutUrl: existingOrder.paymentCheckoutUrl || null,
           paymentMethod: existingOrder.paymentMethod,
           paymentStatus: existingOrder.paymentStatus,
-          amountDueNow: existingOrder.depositAmount || existingOrder.total,
+          amountDueNow: existingOrder.paymentMethod === 'purchase_order' ? 0 : existingOrder.depositAmount || existingOrder.total,
           balanceDue: existingOrder.balanceDue || 0,
           bankTransferInstructions: existingOrder.paymentMethod === 'bank_transfer'
             ? {
@@ -626,6 +644,10 @@ const placeOrder = async (req, res, next) => {
     if (fingerprint !== checkoutQuote.fingerprint) {
       return next(createError(409, 'Cart or delivery address changed. Recalculate shipping and tax before placing the order.'));
     }
+    const depositPercent = Number(process.env.DEPOSIT_PERCENT || 30);
+    if (!Number.isFinite(depositPercent) || depositPercent < 1 || depositPercent > 100) {
+      return next(createError(500, 'DEPOSIT_PERCENT must be between 1 and 100.'));
+    }
 
     // ── Build order lines with locked pricing ───────────────────────────────
     const orderLines = items.map((i) => ({
@@ -675,9 +697,47 @@ const placeOrder = async (req, res, next) => {
           phone:     contact.phone || '',
         };
 
+    let company = null;
+    if (paymentMethod === 'purchase_order') {
+      if (!req.user || req.user.role !== 'dealer' || !req.user.company) {
+        return next(createError(403, 'Purchase order checkout is available only to approved dealer accounts.'));
+      }
+      company = await Company.findOne({
+        _id: req.user.company,
+        type: 'dealer',
+        isActive: true,
+        isApproved: true,
+        paymentTerms: { $in: ['net15', 'net30', 'net45', 'net60'] },
+      }).select('creditLimit pendingBalance');
+      if (!company || !Number.isFinite(company.creditLimit) || company.creditLimit <= 0) {
+        return next(createError(403, 'Your dealer account does not have active purchase-order terms.'));
+      }
+      const reservation = await Company.updateOne(
+        {
+          _id: company._id,
+          isActive: true,
+          isApproved: true,
+          $expr: {
+            $lte: [
+              { $add: [{ $ifNull: ['$pendingBalance', 0] }, checkoutQuote.total] },
+              '$creditLimit',
+            ],
+          },
+        },
+        { $inc: { pendingBalance: checkoutQuote.total } },
+      );
+      if (reservation.modifiedCount !== 1) {
+        return next(createError(409, 'This order exceeds your company credit limit. Contact your account manager.'));
+      }
+      reservedCompanyId = company._id;
+      reservedCredit = checkoutQuote.total;
+    }
+
     // ── Create the order ────────────────────────────────────────────────────
     const order = await Order.create({
       user:        req.user?._id || null,
+      company:     req.user?.company || null,
+      purchaseOrderNumber: paymentMethod === 'purchase_order' ? purchaseOrderNumber.trim() : '',
       guestEmail:  req.user ? null : contact.email.toLowerCase().trim(),
       guestName:   req.user ? null : `${contact.firstName} ${contact.lastName}`.trim(),
       isGuest:     !req.user,
@@ -698,23 +758,23 @@ const placeOrder = async (req, res, next) => {
       taxRate:         checkoutQuote.taxRate,
       total:           checkoutQuote.total,
       currency:        'USD',
-      paymentMethod:   paymentMethod === 'card' ? 'stripe_checkout' : 'bank_transfer',
+      paymentMethod:   paymentMethod === 'card' ? 'stripe_checkout' : paymentMethod === 'purchase_order' ? 'purchase_order' : 'bank_transfer',
       paymentStatus:   'pending',
-      status:          'pending',
+      status:          paymentMethod === 'purchase_order' ? 'confirmed' : 'pending',
       source:          'cart',
       checkoutKey,
       crmSyncStatus:   'pending',
       statusHistory: [{
-        status: 'pending',
-        note:   paymentMethod === 'card' ? 'Order created — awaiting hosted card payment.' : 'Order created — awaiting bank transfer.',
+        status: paymentMethod === 'purchase_order' ? 'confirmed' : 'pending',
+        note: paymentMethod === 'card'
+          ? 'Order created — awaiting hosted card payment.'
+          : paymentMethod === 'purchase_order'
+            ? `Dealer purchase order ${purchaseOrderNumber.trim()} accepted against approved company terms.`
+            : 'Order created — awaiting bank transfer.',
       }],
     });
-    const depositPercent = Number(process.env.DEPOSIT_PERCENT || 30);
-    if (!Number.isFinite(depositPercent) || depositPercent < 1 || depositPercent > 100) {
-      await Order.findByIdAndDelete(order._id);
-      return next(createError(500, 'DEPOSIT_PERCENT must be between 1 and 100.'));
-    }
-    const amountToCollect = paymentPlan === 'deposit' && depositPercent < 100
+    creditOrderCreated = paymentMethod === 'purchase_order';
+    const amountToCollect = paymentMethod === 'purchase_order' ? 0 : paymentPlan === 'deposit' && depositPercent < 100
       ? Math.round(order.total * depositPercent) / 100
       : order.total;
     order.depositAmount = amountToCollect;
@@ -758,9 +818,11 @@ const placeOrder = async (req, res, next) => {
     cart.checkoutStartedAt = null; // no longer abandoned
     await cart.save();
 
-    if (paymentMethod === 'bank_transfer') {
+    if (paymentMethod === 'bank_transfer' || paymentMethod === 'purchase_order') {
       await enqueueOrderEmail(order, 'received', {
-        note: 'We received your order and will begin processing after the bank transfer is confirmed.',
+        note: paymentMethod === 'purchase_order'
+          ? `We received your order against purchase order ${purchaseOrderNumber.trim()}.`
+          : 'We received your order and will begin processing after the bank transfer is confirmed.',
       });
     }
 
@@ -769,6 +831,7 @@ const placeOrder = async (req, res, next) => {
       data: {
         orderId:      order._id,
         orderNumber:  order.orderNumber,
+        purchaseOrderNumber: order.purchaseOrderNumber,
         total:        order.total,
         checkoutUrl,
         paymentMethod: order.paymentMethod,
@@ -792,6 +855,9 @@ const placeOrder = async (req, res, next) => {
       },
     });
   } catch (err) {
+    if (reservedCompanyId && !creditOrderCreated) {
+      await Company.updateOne({ _id: reservedCompanyId }, { $inc: { pendingBalance: -reservedCredit } });
+    }
     if (err.code === 11000 && err.keyPattern?.checkoutKey) {
       const order = await Order.findOne({ checkoutKey: req.get('Idempotency-Key') }).lean();
       if (order) {
@@ -800,11 +866,12 @@ const placeOrder = async (req, res, next) => {
           data: {
             orderId: order._id,
             orderNumber: order.orderNumber,
+            purchaseOrderNumber: order.purchaseOrderNumber,
             total: order.total,
             checkoutUrl: order.paymentCheckoutUrl || null,
             paymentMethod: order.paymentMethod,
             paymentStatus: order.paymentStatus,
-            amountDueNow: order.depositAmount || order.total,
+            amountDueNow: order.paymentMethod === 'purchase_order' ? 0 : order.depositAmount || order.total,
             balanceDue: order.balanceDue || 0,
             bankTransferInstructions: order.paymentMethod === 'bank_transfer'
               ? {

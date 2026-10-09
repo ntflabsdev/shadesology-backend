@@ -56,6 +56,8 @@ const orderSchema = new mongoose.Schema(
 
     // ─── Customer ───────────────────────────────────────────────────────────
     user:         { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    company:      { type: mongoose.Schema.Types.ObjectId, ref: 'Company', default: null, index: true },
+    purchaseOrderNumber: { type: String, trim: true, maxlength: 100, default: '' },
     guestEmail:   { type: String, lowercase: true, trim: true, default: null },
     guestName:    String,
     isGuest:      { type: Boolean, default: false },
